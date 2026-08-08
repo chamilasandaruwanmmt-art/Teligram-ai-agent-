@@ -29,7 +29,7 @@ from playwright.async_api import async_playwright
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"  # free tier friendly
+GEMINI_MODEL = "gemini-flash-latest"  # always points to the current stable Flash model
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

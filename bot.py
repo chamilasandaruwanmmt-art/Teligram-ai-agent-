@@ -13,6 +13,8 @@ Setup:
 import os
 import logging
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -171,7 +173,28 @@ async def on_shutdown(app: Application):
         await _playwright.stop()
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        pass  # silence default HTTP logging
+
+
+def start_health_server():
+    """Render Web Services need an open port to detect the app as 'live'."""
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info(f"Health check server listening on port {port}")
+
+
 def main():
+    start_health_server()
+
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
         raise SystemExit(
             "TELEGRAM_BOT_TOKEN සහ GEMINI_API_KEY environment variables දෙකම set කරන්න."

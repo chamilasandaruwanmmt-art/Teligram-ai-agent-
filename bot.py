@@ -14,6 +14,7 @@ import os
 import logging
 import asyncio
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import (
@@ -34,6 +35,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-flash-latest"  # always points to the current stable Flash model
 DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Supabase Postgres connection string
 HISTORY_LIMIT = 12  # how many past messages to feed back as context per chat
+GENERATED_APPS_DIR = os.environ.get("GENERATED_APPS_DIR", "/tmp/generated_apps")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -216,6 +218,35 @@ async def screenshot_page(url: str, out_path: str, timeout_ms: int = 20000) -> s
         await context.close()
 
 
+async def check_app_for_errors(html: str, timeout_ms: int = 10000) -> list[str]:
+    """Load generated HTML in a headless browser and collect any JS console
+    errors or uncaught exceptions, so we can warn the user before delivery."""
+    browser = await get_browser()
+    context = await browser.new_context()
+    page = await context.new_page()
+    errors: list[str] = []
+
+    def on_console(msg):
+        if msg.type == "error":
+            errors.append(f"Console error: {msg.text}")
+
+    def on_pageerror(exc):
+        errors.append(f"Uncaught error: {exc}")
+
+    page.on("console", on_console)
+    page.on("pageerror", on_pageerror)
+
+    try:
+        await page.set_content(html, timeout=timeout_ms, wait_until="load")
+        await page.wait_for_timeout(1500)  # let any async errors surface
+    except Exception as e:
+        errors.append(f"Load failed: {e}")
+    finally:
+        await context.close()
+
+    return errors
+
+
 # ---------- Gemini call ----------
 def ask_gemini(prompt: str) -> str:
     response = gemini_client.models.generate_content(
@@ -388,17 +419,72 @@ async def buildapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("App එක හදනවා... ටිකක් වෙලාව යනවා ⏳")
     try:
         html = await asyncio.to_thread(build_app_html, description)
+
+        # Test-load the app in a headless browser and check for JS errors
+        await update.message.reply_text("App එක test කරනවා (errors තියෙනවද කියලා)... 🔍")
+        errors = await check_app_for_errors(html)
+
+        # If errors were found, ask Gemini to fix them once and re-check
+        if errors:
+            fix_prompt = (
+                f"{APP_BUILDER_SYSTEM_PROMPT}\n\nApp description: {description}\n\n"
+                f"Here is a previous version of the app that had these errors when loaded:\n"
+                f"{chr(10).join(errors)}\n\n"
+                f"Previous code:\n{html}\n\n"
+                f"Fix the errors and output the corrected COMPLETE single HTML file."
+            )
+            html = await asyncio.to_thread(
+                lambda: gemini_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[{"role": "user", "parts": [{"text": fix_prompt}]}],
+                ).text.strip()
+            )
+            if html.startswith("```"):
+                lines = html.split("\n")
+                lines = lines[1:] if lines[0].startswith("```") else lines
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                html = "\n".join(lines)
+            errors = await check_app_for_errors(html)
+
+        status_msg = (
+            "✅ App එක clean - errors හම්බුනේ නෑ."
+            if not errors
+            else "⚠️ App එක fix කරන්න try කළා, ඒත් තවම මේ errors තියෙනවා:\n" + "\n".join(errors[:5])
+        )
+        await update.message.reply_text(status_msg)
+
+        # Save privately for direct download as a Telegram document
         file_path = f"/tmp/app_{update.message.chat_id}.html"
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(html)
+
+        # Also save into the public /apps/ folder so it gets a shareable link
+        os.makedirs(GENERATED_APPS_DIR, exist_ok=True)
+        public_filename = f"app_{update.message.chat_id}_{uuid.uuid4().hex[:8]}.html"
+        public_path = os.path.join(GENERATED_APPS_DIR, public_filename)
+        with open(public_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        base_url = get_public_base_url()
+        public_link = f"{base_url}/apps/{public_filename}" if base_url else None
+
         with open(file_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename="my_app.html",
-                caption=(
-                    "App එක ready! Download කරලා, phone එකේ browser එකෙන් "
-                    "(Chrome/Brave) open කරන්න. Internet නැතුවත් වැඩ කරයි."
-                ),
+                caption="App එක ready! Download කරලා open කරන්න පුළුවන් (offline වැඩ කරයි).",
+            )
+
+        if public_link:
+            await update.message.reply_text(
+                "📱 Phone එකේ app icon එකක් විදිහට install කරගන්න:\n"
+                f"{public_link}\n\n"
+                "1. මේ link එක Chrome/Brave එකෙන් open කරන්න\n"
+                "2. Menu (⋮) → 'Add to Home screen' select කරන්න\n"
+                "3. Home screen එකේ app icon එකක් විදිහට පේනවා\n\n"
+                "🤖 Real APK file එකක්ම ඕන නම්:\n"
+                "pwabuilder.com යන්න → link එක paste කරන්න → 'Android' package එක download කරන්න."
             )
     except Exception as e:
         logger.exception("Build app error")
@@ -463,6 +549,25 @@ async def on_shutdown(app: Application):
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # Serve generated apps at /apps/<filename>.html so they get a public,
+        # shareable link (used for "Add to Home Screen" and for feeding to
+        # third-party APK builders like pwabuilder.com).
+        if self.path.startswith("/apps/"):
+            filename = os.path.basename(self.path[len("/apps/"):])
+            filepath = os.path.join(GENERATED_APPS_DIR, filename)
+            if os.path.isfile(filepath):
+                with open(filepath, "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
@@ -472,8 +577,20 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass  # silence default HTTP logging
 
 
+def get_public_base_url() -> str:
+    """Render sets RENDER_EXTERNAL_URL automatically for web services."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if url:
+        return url
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+    if hostname:
+        return f"https://{hostname}"
+    return ""
+
+
 def start_health_server():
     """Render Web Services need an open port to detect the app as 'live'."""
+    os.makedirs(GENERATED_APPS_DIR, exist_ok=True)
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), _HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()

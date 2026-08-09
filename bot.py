@@ -25,11 +25,15 @@ from telegram.ext import (
 )
 from google import genai
 from playwright.async_api import async_playwright
+import psycopg2
+from psycopg2 import pool as pg_pool
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-flash-latest"  # always points to the current stable Flash model
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Supabase Postgres connection string
+HISTORY_LIMIT = 12  # how many past messages to feed back as context per chat
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,6 +43,135 @@ logger = logging.getLogger(__name__)
 
 # ---------- Gemini client ----------
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ---------- Postgres (Supabase) memory ----------
+_pg_pool: pg_pool.SimpleConnectionPool | None = None
+
+
+def get_pool() -> pg_pool.SimpleConnectionPool:
+    global _pg_pool
+    if _pg_pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL environment variable එක set කරලා නෑ.")
+        _pg_pool = pg_pool.SimpleConnectionPool(1, 5, dsn=DATABASE_URL)
+    return _pg_pool
+
+
+def init_db():
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS snippets (
+                    chat_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (chat_id, name)
+                )"""
+            )
+    finally:
+        get_pool().putconn(con)
+
+
+def save_message(chat_id: int, role: str, content: str):
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (chat_id, role, content) VALUES (%s, %s, %s)",
+                (chat_id, role, content),
+            )
+    finally:
+        get_pool().putconn(con)
+
+
+def get_recent_history(chat_id: int, limit: int = HISTORY_LIMIT):
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                "SELECT role, content FROM messages WHERE chat_id = %s "
+                "ORDER BY id DESC LIMIT %s",
+                (chat_id, limit),
+            )
+            rows = cur.fetchall()
+    finally:
+        get_pool().putconn(con)
+    return list(reversed(rows))  # oldest -> newest
+
+
+def save_snippet(chat_id: int, name: str, content: str):
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                """INSERT INTO snippets (chat_id, name, content) VALUES (%s, %s, %s)
+                   ON CONFLICT (chat_id, name)
+                   DO UPDATE SET content = EXCLUDED.content, created_at = NOW()""",
+                (chat_id, name, content),
+            )
+    finally:
+        get_pool().putconn(con)
+
+
+def get_snippet(chat_id: int, name: str):
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                "SELECT content FROM snippets WHERE chat_id = %s AND name = %s",
+                (chat_id, name),
+            )
+            row = cur.fetchone()
+    finally:
+        get_pool().putconn(con)
+    return row[0] if row else None
+
+
+def list_snippets(chat_id: int):
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                "SELECT name, created_at FROM snippets WHERE chat_id = %s ORDER BY created_at DESC",
+                (chat_id,),
+            )
+            rows = cur.fetchall()
+    finally:
+        get_pool().putconn(con)
+    return rows
+
+
+def delete_snippet(chat_id: int, name: str) -> bool:
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute(
+                "DELETE FROM snippets WHERE chat_id = %s AND name = %s", (chat_id, name)
+            )
+            deleted = cur.rowcount > 0
+    finally:
+        get_pool().putconn(con)
+    return deleted
+
+
+def clear_history(chat_id: int):
+    con = get_pool().getconn()
+    try:
+        with con, con.cursor() as cur:
+            cur.execute("DELETE FROM messages WHERE chat_id = %s", (chat_id,))
+    finally:
+        get_pool().putconn(con)
 
 # ---------- Playwright browser (shared, lazy-started) ----------
 _playwright = None
@@ -92,15 +225,70 @@ def ask_gemini(prompt: str) -> str:
     return response.text
 
 
+APP_BUILDER_SYSTEM_PROMPT = """You are an expert web app developer. Generate a COMPLETE, SELF-CONTAINED
+single HTML file that implements the app the user describes. Requirements:
+- Everything (HTML, CSS, JS) must be in ONE .html file, no external dependencies except CDN links if truly needed.
+- The app must work fully offline in a browser after download (localStorage is fine for saving data).
+- Make the UI clean and mobile-friendly (the user will likely open this on a phone browser).
+- Output ONLY the raw HTML code. No markdown code fences, no explanation text before or after.
+"""
+
+
+def build_app_html(description: str) -> str:
+    """Ask Gemini to generate a complete single-file HTML app for the given description."""
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            {"role": "user", "parts": [{"text": APP_BUILDER_SYSTEM_PROMPT + "\n\nApp description: " + description}]}
+        ],
+    )
+    html = response.text.strip()
+    # Strip markdown code fences if the model added them despite instructions
+    if html.startswith("```"):
+        lines = html.split("\n")
+        lines = lines[1:] if lines[0].startswith("```") else lines
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        html = "\n".join(lines)
+    return html
+
+
+def ask_gemini_with_history(chat_id: int, prompt: str) -> str:
+    """Build the recent conversation into Gemini's multi-turn `contents` format,
+    call the model, then persist both the user turn and the model reply."""
+    history = get_recent_history(chat_id)
+    contents = []
+    for role, content in history:
+        gemini_role = "user" if role == "user" else "model"
+        contents.append({"role": gemini_role, "parts": [{"text": content}]})
+    contents.append({"role": "user", "parts": [{"text": prompt}]})
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+    )
+    answer = response.text
+
+    save_message(chat_id, "user", prompt)
+    save_message(chat_id, "model", answer)
+    return answer
+
+
 # ---------- Telegram handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "AI agent bot එක ready.\n\n"
         "Commands:\n"
-        "/ask <question> - Gemini AI ගෙන් අහන්න\n"
+        "/ask <question> - Gemini AI ගෙන් අහන්න (chat history මතකයි)\n"
         "/browse <url> - page එකේ content කියවලා summarize කරන්න\n"
         "/shot <url> - page එකේ screenshot එකක් ගන්න\n"
-        "සාමාන්‍ය message එකක් type කළත් AI reply එකක් දෙනවා."
+        "/save <name> <content> - Pine Script/notes save කරන්න\n"
+        "/recall <name> - save කරපු එකක් ආපහු බලන්න\n"
+        "/list - save කරපු ඔක්කොම names බලන්න\n"
+        "/forget <name> - save කරපු එකක් delete කරන්න\n"
+        "/reset - chat history clear කරන්න (fresh start)\n"
+        "/buildapp <description> - AI ම app එකක් හදලා download link (file) එකක් දෙනවා\n\n"
+        "සාමාන්‍ය message එකක් type කළත් AI reply එකක් දෙනවා, කලින් chat එකත් මතක තියාගෙන."
     )
 
 
@@ -109,12 +297,103 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         await update.message.reply_text("Usage: /ask <question>")
         return
+    chat_id = update.message.chat_id
     await update.message.chat.send_action("typing")
     try:
-        answer = await asyncio.to_thread(ask_gemini, query)
+        answer = await asyncio.to_thread(ask_gemini_with_history, chat_id, query)
         await update.message.reply_text(answer)
     except Exception as e:
         logger.exception("Gemini error")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /save <name> <content>\n"
+            "උදා: /save jobless_v2 [Pine Script code එක මෙතනින්]"
+        )
+        return
+    name = context.args[0]
+    content = " ".join(context.args[1:])
+    chat_id = update.message.chat_id
+    try:
+        await asyncio.to_thread(save_snippet, chat_id, name, content)
+        await update.message.reply_text(f"'{name}' save කළා. ආපහු ගන්න: /recall {name}")
+    except Exception as e:
+        logger.exception("Save error")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def recall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /recall <name>")
+        return
+    name = context.args[0]
+    chat_id = update.message.chat_id
+    content = await asyncio.to_thread(get_snippet, chat_id, name)
+    if content is None:
+        await update.message.reply_text(f"'{name}' කියලා දෙයක් save කරලා නෑ. /list කරලා බලන්න.")
+    else:
+        # Telegram message limit is ~4096 chars; split if needed
+        for i in range(0, len(content), 4000):
+            await update.message.reply_text(content[i:i + 4000])
+
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    rows = await asyncio.to_thread(list_snippets, chat_id)
+    if not rows:
+        await update.message.reply_text("තවම කිසිම එකක් save කරලා නෑ.")
+        return
+    lines = "\n".join(f"- {name} ({created})" for name, created in rows)
+    await update.message.reply_text(f"Save කරපු items:\n{lines}")
+
+
+async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /forget <name>")
+        return
+    name = context.args[0]
+    chat_id = update.message.chat_id
+    deleted = await asyncio.to_thread(delete_snippet, chat_id, name)
+    if deleted:
+        await update.message.reply_text(f"'{name}' delete කළා.")
+    else:
+        await update.message.reply_text(f"'{name}' කියලා දෙයක් හම්බුනේ නෑ.")
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    await asyncio.to_thread(clear_history, chat_id)
+    await update.message.reply_text("Chat history clear කළා. අලුතින් පටන් ගමු.")
+
+
+async def buildapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    description = " ".join(context.args)
+    if not description:
+        await update.message.reply_text(
+            "Usage: /buildapp <app description>\n"
+            "උදා: /buildapp calculator app එකක්, results notebook එකකට local save කරන්න පුළුවන්"
+        )
+        return
+    await update.message.reply_text("App එක හදනවා... ටිකක් වෙලාව යනවා ⏳")
+    try:
+        html = await asyncio.to_thread(build_app_html, description)
+        file_path = f"/tmp/app_{update.message.chat_id}.html"
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        with open(file_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="my_app.html",
+                caption=(
+                    "App එක ready! Download කරලා, phone එකේ browser එකෙන් "
+                    "(Chrome/Brave) open කරන්න. Internet නැතුවත් වැඩ කරයි."
+                ),
+            )
+    except Exception as e:
+        logger.exception("Build app error")
         await update.message.reply_text(f"Error: {e}")
 
 
@@ -154,11 +433,12 @@ async def shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback: any plain text message goes to Gemini directly."""
+    """Fallback: any plain text message goes to Gemini, with memory of recent turns."""
     text = update.message.text
+    chat_id = update.message.chat_id
     await update.message.chat.send_action("typing")
     try:
-        answer = await asyncio.to_thread(ask_gemini, text)
+        answer = await asyncio.to_thread(ask_gemini_with_history, chat_id, text)
         await update.message.reply_text(answer)
     except Exception as e:
         logger.exception("Chat error")
@@ -194,6 +474,7 @@ def start_health_server():
 
 def main():
     start_health_server()
+    init_db()
 
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
         raise SystemExit(
@@ -206,6 +487,12 @@ def main():
     app.add_handler(CommandHandler("ask", ask))
     app.add_handler(CommandHandler("browse", browse))
     app.add_handler(CommandHandler("shot", shot))
+    app.add_handler(CommandHandler("save", save_cmd))
+    app.add_handler(CommandHandler("recall", recall_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("forget", forget_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("buildapp", buildapp_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     logger.info("Bot starting...")

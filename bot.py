@@ -292,6 +292,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def send_long_text(message, text: str):
+    """Telegram caps messages at ~4096 chars; split longer replies into chunks."""
+    if not text:
+        text = "(empty reply)"
+    for i in range(0, len(text), 4000):
+        await message.reply_text(text[i:i + 4000])
+
+
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     if not query:
@@ -301,7 +309,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
     try:
         answer = await asyncio.to_thread(ask_gemini_with_history, chat_id, query)
-        await update.message.reply_text(answer)
+        await send_long_text(update.message, answer)
     except Exception as e:
         logger.exception("Gemini error")
         await update.message.reply_text(f"Error: {e}")
@@ -439,7 +447,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
     try:
         answer = await asyncio.to_thread(ask_gemini_with_history, chat_id, text)
-        await update.message.reply_text(answer)
+        await send_long_text(update.message, answer)
     except Exception as e:
         logger.exception("Chat error")
         await update.message.reply_text(f"Error: {e}")
